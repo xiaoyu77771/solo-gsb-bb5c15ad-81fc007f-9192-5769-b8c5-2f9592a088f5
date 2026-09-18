@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import run_audit
+from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
     FAILED,
@@ -101,6 +102,33 @@ class AuditRequest(BaseModel):
     )
 
 
+class LicenseAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    licenses: dict[str, str] = Field(
+        ...,
+        description=(
+            "Package -> SPDX license expression. Resolved packages without an "
+            "entry are reported as 'missing'; entries for packages that are "
+            "not resolved are ignored."
+        ),
+    )
+    allowed: list[str] = Field(
+        default_factory=list,
+        description="SPDX identifiers considered compliant.",
+    )
+    denied: list[str] = Field(
+        default_factory=list,
+        description=(
+            "SPDX identifiers considered violations. Denied takes precedence "
+            "when an identifier appears in both sets."
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Open the SQLite job store and start the background worker.
@@ -124,7 +152,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -238,6 +266,23 @@ async def audit_vulnerabilities_endpoint(payload: AuditRequest) -> JSONResponse:
     ``<root>`` -> package paths; unreachable hits are listed as ``orphaned``.
     """
     body = run_audit(payload.resolved, payload.dependency_graph, payload.advisories)
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/audit/licenses")
+async def audit_licenses_endpoint(payload: LicenseAuditRequest) -> JSONResponse:
+    """Check resolved packages against a local license policy.
+
+    Takes the ``resolved`` mapping from a successful ``/resolve`` response, a
+    package -> SPDX expression mapping, and ``allowed``/``denied`` identifier
+    sets.  Every resolved package is classified as ``violation``,
+    ``compliant``, ``unknown`` or ``missing`` (no expression provided), with
+    the normalized expression and the identifiers that decided the status.
+    Any invalid SPDX expression fails the whole request with 400.
+    """
+    body = run_license_audit(
+        payload.resolved, payload.licenses, payload.allowed, payload.denied
+    )
     return JSONResponse(status_code=200, content=body)
 
 
