@@ -19,6 +19,7 @@ from .jobs import (
     JobStore,
     JobWorker,
 )
+from .license_audit import run_license_audit
 from .resolver import (
     ResolutionInputError,
     parse_index,
@@ -98,6 +99,26 @@ class AuditRequest(BaseModel):
     advisories: list[AdvisoryInput] = Field(
         default_factory=list,
         description="Local advisories to match against the resolved versions.",
+    )
+
+
+class LicenseAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    licenses: dict[str, str] = Field(
+        ...,
+        description="Package -> SPDX license expression (AND/OR/WITH and parentheses).",
+    )
+    allowed: list[str] = Field(
+        default_factory=list,
+        description="License/exception identifiers considered compliant.",
+    )
+    denied: list[str] = Field(
+        default_factory=list,
+        description="License/exception identifiers considered violations (wins over allowed).",
     )
 
 
@@ -238,6 +259,23 @@ async def audit_vulnerabilities_endpoint(payload: AuditRequest) -> JSONResponse:
     ``<root>`` -> package paths; unreachable hits are listed as ``orphaned``.
     """
     body = run_audit(payload.resolved, payload.dependency_graph, payload.advisories)
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/audit/licenses")
+async def audit_licenses_endpoint(payload: LicenseAuditRequest) -> JSONResponse:
+    """Audit resolved packages against a local license allow/deny policy.
+
+    Takes the ``resolved`` mapping from a successful ``/resolve`` response
+    plus a package -> SPDX expression mapping and ``allowed``/``denied``
+    identifier sets.  Every resolved package is classified as ``compliant``,
+    ``violation``, ``unknown`` or ``missing`` (no expression supplied);
+    ``WITH`` is judged like ``AND`` (license and exception separately).
+    Invalid expressions fail the whole request with 400 -- no partial results.
+    """
+    body = run_license_audit(
+        payload.resolved, payload.licenses, payload.allowed, payload.denied
+    )
     return JSONResponse(status_code=200, content=body)
 
 

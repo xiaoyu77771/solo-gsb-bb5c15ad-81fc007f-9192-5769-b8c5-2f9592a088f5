@@ -32,6 +32,11 @@
   `resolved` 与 `dependency_graph`，对照本地公告列表（PEP 440 受影响范围）匹配
   已解析版本；每个命中项给出从 `<root>` 到该包的**全部最短路径**（支持环与菱形
   依赖，路径去重并按节点序列稳定排序），不可达命中单列为 `orphaned`。
+- **许可证策略审计**：`POST /audit/licenses` 接收 `resolved` 与包名 → SPDX
+  表达式映射，对照本地 `allowed` / `denied` 标识符集合，把每个已解析包分类为
+  `compliant` / `violation` / `unknown` / `missing`。表达式由成熟的
+  [`license-expression`](https://github.com/aboutcode-org/license-expression)
+  库解析（ScanCode 同款 SPDX 解析器），完整支持括号、`AND`、`OR`、`WITH`。
 
 ## 一条命令启动
 
@@ -46,6 +51,7 @@ docker compose up --build
 - `GET /health` — 健康检查
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
+- `POST /audit/licenses` — 用本地许可证策略审计已解析的包集合
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -214,6 +220,99 @@ curl -s -X POST localhost:8000/audit/vulnerabilities \
 - 边的 `source_version` / `target_version` 必须与 `resolved` 中对应版本一致
   （`<root>` 边的 `source_version` 必须为空）。
 
+## 许可证审计 API
+
+`POST /audit/licenses` 接收 `/resolve` **成功响应**中的 `resolved`、一份
+包名 → SPDX 许可证表达式映射，以及本地 `allowed` / `denied` 标识符集合，按策略
+对每个已解析包分类：
+
+```bash
+curl -s -X POST localhost:8000/audit/licenses \
+  -H 'Content-Type: application/json' -d '{
+  "resolved": {"app": "1.0", "web": "2.0", "db": "1.0", "legacy": "0.9"},
+  "licenses": {
+    "app": "mit",
+    "web": "apache-2.0 WITH llvm-exception",
+    "db": "GPL-3.0-only OR (Apache-2.0 AND BSD-3-Clause)"
+  },
+  "allowed": ["MIT", "Apache-2.0", "LLVM-exception"],
+  "denied": ["GPL-3.0-only"]
+}'
+```
+
+请求字段：
+
+- `resolved`：包名 → 已解析版本（PEP 440），即 `/resolve` 的 `resolved`。
+- `licenses`：包名 → SPDX 许可证表达式。表达式由
+  [`license-expression`](https://github.com/aboutcode-org/license-expression)
+  解析，支持括号、`AND`、`OR`、`WITH`；已知 SPDX 标识符大小写不敏感并会被规范化
+  （如 `mit` → `MIT`），未收录的标识符按原样匹配。`resolved` 中缺少表达式的包
+  记为 `missing`。
+- `allowed` / `denied`：许可证/例外标识符集合（单个标识符，不能是表达式）。
+  同一标识符同时出现在两者中时 **`denied` 优先**。
+
+分类规则：
+
+- 单个标识符：在 `denied` 中为 `violation`，在 `allowed` 中为 `compliant`，
+  否则为 `unknown`；
+- `WITH` 按 `AND` 处理：许可证与例外分别判定后再合并；
+- `AND`：任一子项为 `violation` 即 `violation`；否则任一 `unknown` 即 `unknown`；
+  全部 `compliant` 才是 `compliant`；
+- `OR`：任一子项为 `compliant` 即 `compliant`；否则任一 `unknown` 即 `unknown`；
+  全部 `violation` 才是 `violation`。
+
+响应（200，节选）：
+
+```json
+{
+  "status": "ok",
+  "summary": {"packages": 4, "compliant": 2, "violation": 0, "unknown": 1, "missing": 1},
+  "compliant": [
+    {
+      "package": "app",
+      "version": "1.0",
+      "expression": "MIT",
+      "status": "compliant",
+      "deciding_identifiers": ["MIT"]
+    },
+    {
+      "package": "web",
+      "version": "2.0",
+      "expression": "Apache-2.0 WITH LLVM-exception",
+      "status": "compliant",
+      "deciding_identifiers": ["Apache-2.0", "LLVM-exception"]
+    }
+  ],
+  "violation": [],
+  "unknown": [
+    {
+      "package": "db",
+      "version": "1.0",
+      "expression": "GPL-3.0-only OR (Apache-2.0 AND BSD-3-Clause)",
+      "status": "unknown",
+      "deciding_identifiers": ["BSD-3-Clause"]
+    }
+  ],
+  "missing": [
+    {
+      "package": "legacy",
+      "version": "0.9",
+      "expression": null,
+      "status": "missing",
+      "deciding_identifiers": []
+    }
+  ]
+}
+```
+
+- 四个清单分别列出各状态的包；每个条目含规范化包名、已解析版本、**规范化后的
+  SPDX 表达式**（`missing` 为 `null`）、状态，以及**决定该状态的标识符**
+  （自身分类与最终状态一致的叶子标识符，去重排序）。所有清单按规范化包名稳定
+  排序，相同输入永远得到相同输出。
+- 所有表达式与策略标识符在分类前统一校验：任一表达式非法（括号不配对、悬空
+  运算符、空串等）或策略项不是单个标识符，整个请求返回 `400`（错误体与
+  `/resolve` 相同），**不产生任何部分结果**。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -369,13 +468,14 @@ pytest -q
 
 ```
 app/
-  resolver.py    # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
-  serialize.py   # 冲突树 / 终态冲突的 JSON 序列化
-  audit.py       # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
-  jobs.py        # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py        # FastAPI 应用与 /resolve、/audit/vulnerabilities、/jobs、/health
-tests/           # 端到端 API 测试（含漏洞审计）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
-data/            # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
+  resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
+  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
+  audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
+  license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、状态分类
+  jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
+  main.py           # FastAPI 应用与 /resolve、/audit/vulnerabilities、/audit/licenses、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞与许可证审计）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
 requirements.txt
